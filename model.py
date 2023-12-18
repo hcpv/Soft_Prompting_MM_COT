@@ -22,10 +22,17 @@ from transformers.utils.model_parallel_utils import assert_device_map, get_devic
 from torch.utils.checkpoint import checkpoint
 
 class JointEncoder(T5Stack):
-    def __init__(self, config, embed_tokens=None, patch_size=None):
+    def __init__(self, config, embed_tokens=None, patch_size=None, n_ctx=64):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
+
+        #CS839 start
+        ctx_vectors = torch.empty(n_ctx, embed_tokens.shape[1])
+        nn.init.normal_(ctx_vectors, std=0.02)
+        self.ctx = nn.Parameter(ctx_vectors)
+        #CS839 end
+
         self.is_decoder = config.is_decoder
 
         self.patch_num, self.patch_dim = patch_size
@@ -139,6 +146,10 @@ class JointEncoder(T5Stack):
         if inputs_embeds is None:
             assert self.embed_tokens is not None, "You have to initialize the model with valid token embeddings"
             inputs_embeds = self.embed_tokens(input_ids)
+
+        #CS839 start
+        inputs_embeds = torch.cat((input_embeds, self.ctx), dim=1)
+        #CS839 end
 
         batch_size, seq_length = input_shape
 
@@ -325,7 +336,7 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         r"decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
     ]
 
-    def __init__(self, config: T5Config, patch_size):
+    def __init__(self, config: T5Config, patch_size, n_ctx):
         super().__init__(config)
         self.model_dim = config.d_model
 
@@ -336,7 +347,7 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         # self.encoder = T5Stack(encoder_config, self.shared)
-        self.encoder = JointEncoder(encoder_config, self.shared, patch_size)
+        self.encoder = JointEncoder(encoder_config, self.shared, patch_size, n_ctx)
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
