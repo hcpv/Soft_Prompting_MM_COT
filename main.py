@@ -6,7 +6,6 @@ import re
 
 import numpy as np
 import torch
-from model import T5ForMultimodalGeneration
 from rich import box
 from rich.console import Console
 from rich.table import Column, Table
@@ -17,6 +16,8 @@ from transformers import (
     Seq2SeqTrainingArguments,
     T5ForConditionalGeneration,
 )
+
+from model import T5ForMultimodalGeneration
 from utils_data import (
     ScienceQADatasetImg,
     ScienceQADatasetStd,
@@ -41,8 +42,8 @@ def parse_args():
     parser.add_argument("--epoch", type=int, default=20)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--bs", type=int, default=16)
-    parser.add_argument("--input_len", type=int, default=512)
-    parser.add_argument('--n_ctx', type=int, default=64)
+    parser.add_argument("--input_len", type=int, default=448)
+    parser.add_argument("--n_ctx", type=int, default=64)
     parser.add_argument("--output_len", type=int, default=64)
     parser.add_argument("--eval_bs", type=int, default=16)
     parser.add_argument(
@@ -149,6 +150,14 @@ def T5Trainer(
         model = T5ForMultimodalGeneration.from_pretrained(
             args.model, patch_size=patch_size, n_ctx=args.n_ctx
         )
+        if args.n_ctx:
+            for name, params in model.named_parameters():
+                if "ctx" not in name and "lm_head" not in name:
+                    params.requires_grad = False
+                else:
+                    print(f"Initial weights of {name}")
+                    print(params)
+
         name_maps = dataframe["name_maps"]
         image_features = dataframe["image_features"]
         train_set = ScienceQADatasetImg(
@@ -214,7 +223,8 @@ def T5Trainer(
         )
 
     datacollator = DataCollatorForSeq2Seq(tokenizer)
-    print("model parameters: ", model.num_parameters())
+    print("Overall model parameters: ", model.num_parameters())
+    print("Trainable model parameters: ", model.num_parameters(only_trainable=True))
 
     def extract_ans(ans):
         pattern = re.compile(r"The answer is \(([A-Z])\)")
@@ -339,7 +349,6 @@ def T5Trainer(
             load_best_model_at_end=True,
             report_to="none",
         )
-
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
@@ -353,26 +362,6 @@ def T5Trainer(
     )
 
     if args.evaluate_dir is None:
-
-        #CS839 start
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-
-        for param in model.decoder.parameters():
-            param.requires_grad = False
-
-        for param in model.shared.parameters():
-            param.requires_grad = False
-
-        for param in model.lm_head.parameters():
-            param.requires_grad = False
-
-        # Unfreeze the context vectors for training
-        for param in model.encoder.ctx.parameters():
-            param.requires_grad = True
-
-        #CS839 end
-
         trainer.train()
         trainer.save_model(save_dir)
 

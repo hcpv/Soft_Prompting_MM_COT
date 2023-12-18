@@ -1,50 +1,63 @@
-'''
+"""
 Adapted from https://github.com/huggingface/transformers and https://github.com/j-min/VL-T5
-'''
+"""
 
-from transformers import T5Config, T5ForConditionalGeneration
-from transformers.models.t5.modeling_t5 import T5Stack, __HEAD_MASK_WARNING_MSG, T5Block, T5LayerNorm
 import copy
-from transformers.modeling_outputs import ModelOutput, BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions, Seq2SeqLMOutput, Seq2SeqModelOutput
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import math
 import os
 import warnings
-from typing import Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from torch.utils.checkpoint import checkpoint
+from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import (
     BaseModelOutput,
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPastAndCrossAttentions,
+    ModelOutput,
     Seq2SeqLMOutput,
+    Seq2SeqModelOutput,
+)
+from transformers.models.t5.modeling_t5 import (
+    __HEAD_MASK_WARNING_MSG,
+    T5Block,
+    T5LayerNorm,
+    T5Stack,
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
-from torch.utils.checkpoint import checkpoint
+
 
 class JointEncoder(T5Stack):
-    def __init__(self, config, embed_tokens=None, patch_size=None, n_ctx=64):
+    def __init__(self, config, embed_tokens=None, patch_size=None):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
-
-        #CS839 start
-        ctx_vectors = torch.empty(n_ctx, embed_tokens.shape[1])
-        nn.init.normal_(ctx_vectors, std=0.02)
-        self.ctx = nn.Parameter(ctx_vectors)
-        #CS839 end
-
         self.is_decoder = config.is_decoder
 
         self.patch_num, self.patch_dim = patch_size
         self.image_dense = nn.Linear(self.patch_dim, config.d_model)
-        self.mha_layer = torch.nn.MultiheadAttention(embed_dim=config.hidden_size, kdim=config.hidden_size, vdim=config.hidden_size, num_heads=1, batch_first=True)
-        self.gate_dense = nn.Linear(2*config.hidden_size, config.hidden_size)
+        self.mha_layer = torch.nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            kdim=config.hidden_size,
+            vdim=config.hidden_size,
+            num_heads=1,
+            batch_first=True,
+        )
+        self.gate_dense = nn.Linear(2 * config.hidden_size, config.hidden_size)
         self.sigmoid = nn.Sigmoid()
 
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [
+                T5Block(config, has_relative_attention_bias=bool(i == 0))
+                for i in range(config.num_layers)
+            ]
         )
-        self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.final_layer_norm = T5LayerNorm(
+            config.d_model, eps=config.layer_norm_epsilon
+        )
         self.dropout = nn.Dropout(config.dropout_rate)
 
         # Initialize weights and apply final processing
@@ -64,11 +77,17 @@ class JointEncoder(T5Stack):
         )
         # Check validity of device_map
         self.device_map = (
-            get_device_map(len(self.block), range(torch.cuda.device_count())) if device_map is None else device_map
+            get_device_map(len(self.block), range(torch.cuda.device_count()))
+            if device_map is None
+            else device_map
         )
         assert_device_map(self.device_map, len(self.block))
         self.model_parallel = True
-        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
+        self.first_device = (
+            "cpu"
+            if "cpu" in self.device_map.keys()
+            else "cuda:" + str(min(self.device_map.keys()))
+        )
         self.last_device = "cuda:" + str(max(self.device_map.keys()))
         # Load onto devices
         for k, v in self.device_map.items():
@@ -123,11 +142,19 @@ class JointEncoder(T5Stack):
             torch.cuda.set_device(self.first_device)
             self.embed_tokens = self.embed_tokens.to(self.first_device)
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if input_ids is not None and inputs_embeds is not None:
             err_msg_prefix = "decoder_" if self.is_decoder else ""
@@ -141,30 +168,45 @@ class JointEncoder(T5Stack):
             input_shape = inputs_embeds.size()[:-1]
         else:
             err_msg_prefix = "decoder_" if self.is_decoder else ""
-            raise ValueError(f"You have to specify either {err_msg_prefix}input_ids or {err_msg_prefix}inputs_embeds")
+            raise ValueError(
+                f"You have to specify either {err_msg_prefix}input_ids or {err_msg_prefix}inputs_embeds"
+            )
 
         if inputs_embeds is None:
-            assert self.embed_tokens is not None, "You have to initialize the model with valid token embeddings"
+            assert (
+                self.embed_tokens is not None
+            ), "You have to initialize the model with valid token embeddings"
             inputs_embeds = self.embed_tokens(input_ids)
-
-        #CS839 start
-        inputs_embeds = torch.cat((input_embeds, self.ctx), dim=1)
-        #CS839 end
 
         batch_size, seq_length = input_shape
 
         # required mask seq length can be calculated via length of past
-        mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
+        mask_seq_length = (
+            past_key_values[0][0].shape[2] + seq_length
+            if past_key_values is not None
+            else seq_length
+        )
 
         if use_cache is True:
-            assert self.is_decoder, f"`use_cache` can only be set to `True` if {self} is used as a decoder"
+            assert (
+                self.is_decoder
+            ), f"`use_cache` can only be set to `True` if {self} is used as a decoder"
 
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
-        if self.is_decoder and encoder_attention_mask is None and encoder_hidden_states is not None:
+            attention_mask = torch.ones(
+                batch_size, mask_seq_length, device=inputs_embeds.device
+            )
+        if (
+            self.is_decoder
+            and encoder_attention_mask is None
+            and encoder_hidden_states is not None
+        ):
             encoder_seq_length = encoder_hidden_states.shape[1]
             encoder_attention_mask = torch.ones(
-                batch_size, encoder_seq_length, device=inputs_embeds.device, dtype=torch.long
+                batch_size,
+                encoder_seq_length,
+                device=inputs_embeds.device,
+                dtype=torch.long,
             )
 
         # initialize past_key_values with `None` if past does not exist
@@ -173,22 +215,34 @@ class JointEncoder(T5Stack):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
+        extended_attention_mask = self.get_extended_attention_mask(
+            attention_mask, input_shape
+        )
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if self.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            (
+                encoder_batch_size,
+                encoder_sequence_length,
+                _,
+            ) = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
             if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+                encoder_attention_mask = torch.ones(
+                    encoder_hidden_shape, device=inputs_embeds.device
+                )
+            encoder_extended_attention_mask = self.invert_attention_mask(
+                encoder_attention_mask
+            )
         else:
             encoder_extended_attention_mask = None
 
         # Prepare head mask if needed
         head_mask = self.get_head_mask(head_mask, self.config.num_layers)
-        cross_attn_head_mask = self.get_head_mask(cross_attn_head_mask, self.config.num_layers)
+        cross_attn_head_mask = self.get_head_mask(
+            cross_attn_head_mask, self.config.num_layers
+        )
         present_key_value_states = () if use_cache else None
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -198,7 +252,9 @@ class JointEncoder(T5Stack):
 
         hidden_states = self.dropout(inputs_embeds)
 
-        for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
+        for i, (layer_module, past_key_value) in enumerate(
+            zip(self.block, past_key_values)
+        ):
             layer_head_mask = head_mask[i]
             cross_attn_layer_head_mask = cross_attn_head_mask[i]
             # Model parallel
@@ -210,15 +266,23 @@ class JointEncoder(T5Stack):
                 if position_bias is not None:
                     position_bias = position_bias.to(hidden_states.device)
                 if encoder_hidden_states is not None:
-                    encoder_hidden_states = encoder_hidden_states.to(hidden_states.device)
+                    encoder_hidden_states = encoder_hidden_states.to(
+                        hidden_states.device
+                    )
                 if encoder_extended_attention_mask is not None:
-                    encoder_extended_attention_mask = encoder_extended_attention_mask.to(hidden_states.device)
+                    encoder_extended_attention_mask = (
+                        encoder_extended_attention_mask.to(hidden_states.device)
+                    )
                 if encoder_decoder_position_bias is not None:
-                    encoder_decoder_position_bias = encoder_decoder_position_bias.to(hidden_states.device)
+                    encoder_decoder_position_bias = encoder_decoder_position_bias.to(
+                        hidden_states.device
+                    )
                 if layer_head_mask is not None:
                     layer_head_mask = layer_head_mask.to(hidden_states.device)
                 if cross_attn_layer_head_mask is not None:
-                    cross_attn_layer_head_mask = cross_attn_layer_head_mask.to(hidden_states.device)
+                    cross_attn_layer_head_mask = cross_attn_layer_head_mask.to(
+                        hidden_states.device
+                    )
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -274,10 +338,14 @@ class JointEncoder(T5Stack):
             # (cross-attention position bias), (cross-attention weights)
             position_bias = layer_outputs[2]
             if self.is_decoder and encoder_hidden_states is not None:
-                encoder_decoder_position_bias = layer_outputs[4 if output_attentions else 3]
+                encoder_decoder_position_bias = layer_outputs[
+                    4 if output_attentions else 3
+                ]
             # append next layer key value states
             if use_cache:
-                present_key_value_states = present_key_value_states + (present_key_value_state,)
+                present_key_value_states = present_key_value_states + (
+                    present_key_value_state,
+                )
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[3],)
@@ -296,11 +364,11 @@ class JointEncoder(T5Stack):
         # Add last layer
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
-        
+
         image_embedding = self.image_dense(image_ids)
 
         image_att, _ = self.mha_layer(hidden_states, image_embedding, image_embedding)
-        
+
         merge = torch.cat([hidden_states, image_att], dim=-1)
         gate = self.sigmoid(self.gate_dense(merge))
         hidden_states = (1 - gate) * hidden_states + gate * image_att
@@ -336,9 +404,18 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         r"decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
     ]
 
-    def __init__(self, config: T5Config, patch_size, n_ctx):
+    def __init__(self, config: T5Config, patch_size, n_ctx=0):
         super().__init__(config)
         self.model_dim = config.d_model
+
+        self.n_ctx = n_ctx
+
+        # CS839 start
+        if self.n_ctx:
+            ctx_vectors = torch.empty(self.n_ctx, self.model_dim)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            self.ctx = nn.Parameter(ctx_vectors)
+        # CS839 end
 
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
@@ -347,7 +424,7 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         # self.encoder = T5Stack(encoder_config, self.shared)
-        self.encoder = JointEncoder(encoder_config, self.shared, patch_size, n_ctx)
+        self.encoder = JointEncoder(encoder_config, self.shared, patch_size)
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
@@ -383,8 +460,29 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
+        # if input_ids is not None:
+        #     print("input_ids", input_ids.size())
+        # if attention_mask is not None:
+        #     print("attention_mask", attention_mask.size())
+        if self.n_ctx is not None and input_ids is not None:
+            inputs_embeds = self.shared(input_ids)
+            input_ids = None
+            ctx_expanded = torch.unsqueeze(self.ctx, dim=0)
+            ctx_broadcasted = ctx_expanded.expand(inputs_embeds.size()[0], -1, -1)
+
+            inputs_embeds = torch.cat((inputs_embeds, ctx_broadcasted), dim=1)
+
+            context_attention_mask = torch.ones(
+                ctx_broadcasted.size()[0],
+                ctx_broadcasted.size()[1],
+                device=inputs_embeds.device,
+            )
+            attention_mask = torch.cat((attention_mask, context_attention_mask), dim=1)
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
         if head_mask is not None and decoder_head_mask is None:
@@ -418,7 +516,11 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         if self.model_parallel:
             torch.cuda.set_device(self.decoder.first_device)
 
-        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+        if (
+            labels is not None
+            and decoder_input_ids is None
+            and decoder_inputs_embeds is None
+        ):
             # get decoder inputs from shifting lm labels to the right
             decoder_input_ids = self._shift_right(labels)
 
@@ -431,7 +533,9 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.decoder.first_device)
             if decoder_attention_mask is not None:
-                decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+                decoder_attention_mask = decoder_attention_mask.to(
+                    self.decoder.first_device
+                )
 
         # Decode
         decoder_outputs = self.decoder(
@@ -487,9 +591,15 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         )
 
     def prepare_inputs_for_generation(
-        self, decoder_input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
+        self,
+        decoder_input_ids,
+        past=None,
+        attention_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs,
     ):
-    # cut decoder_input_ids if past is used
+        # cut decoder_input_ids if past is used
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
@@ -503,26 +613,22 @@ class T5ForMultimodalGeneration(T5ForConditionalGeneration):
         }
 
         if "image_ids" in kwargs:
-            output["image_ids"] = kwargs['image_ids']
+            output["image_ids"] = kwargs["image_ids"]
 
         return output
-    
+
     def test_step(self, tokenizer, batch, **kwargs):
         device = next(self.parameters()).device
-        input_ids = batch['input_ids'].to(device)
-        image_ids = batch['image_ids'].to(device)
+        input_ids = batch["input_ids"].to(device)
+        image_ids = batch["image_ids"].to(device)
 
-        output = self.generate(
-            input_ids=input_ids,
-            image_ids=image_ids,
-            **kwargs
-        )
+        output = self.generate(input_ids=input_ids, image_ids=image_ids, **kwargs)
 
         generated_sents = tokenizer.batch_decode(output, skip_special_tokens=True)
-        targets = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+        targets = tokenizer.batch_decode(batch["labels"], skip_special_tokens=True)
 
         result = {}
-        result['preds'] = generated_sents
-        result['targets'] = targets
+        result["preds"] = generated_sents
+        result["targets"] = targets
 
         return result
