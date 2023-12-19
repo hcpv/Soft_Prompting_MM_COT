@@ -97,6 +97,7 @@ def parse_args():
         default=None,
         help="the directory of model for evaluation",
     )
+    parser.add_argument("--train_with_evaluate_dir", type=int, default=0)
     parser.add_argument("--caption_file", type=str, default="data/captions.json")
     parser.add_argument(
         "--use_caption", action="store_true", help="use image captions or not"
